@@ -1,0 +1,22 @@
+diff --git a/opendmr.cpp b/opendmr.cpp
+index f0e3425..29266c0 100644
+--- a/opendmr.cpp
++++ b/opendmr.cpp
+@@ -335,8 +335,15 @@ static void bits49_to_frame72(const uint8_t *bits49, uint8_t *frame72)
+     /* Golay encode C0 -> A block (24 bits) */
+     uint32_t a = CGolay24128::encode24128(c0);
+ 
+-    /* Golay encode C1, then scramble with PRNG -> B block (23 bits) */
+-    uint32_t b_codeword = CGolay24128::encode23127(c1);
++    /* Golay encode C1, then scramble with PRNG -> B block (23 bits).
++     *
++     * ENCODING_TABLE_23127 stores the codeword left-shifted by one, in a 24-bit
++     * field, but decode23127() expects it right-aligned — it recovers the data
++     * with 'code >> 11'. Without the shift below, encode and decode are
++     * misaligned by a bit and the PRNG mask is applied at the wrong offset too,
++     * so a frame does not survive its own round trip: 49 -> 72 -> 49 corrupts
++     * the parameters and the audio degrades noticeably. */
++    uint32_t b_codeword = CGolay24128::encode23127(c1) >> 1;
+     uint32_t prng_mask = compute_prng_mask_23bit(c0);
+     b_codeword ^= prng_mask;
+ 

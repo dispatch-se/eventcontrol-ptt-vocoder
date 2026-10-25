@@ -1,0 +1,167 @@
+diff --git a/opendmr.cpp b/opendmr.cpp
+index 04e27a1..f0e3425 100644
+--- a/opendmr.cpp
++++ b/opendmr.cpp
+@@ -261,7 +261,7 @@ void opendmr_encoder_set_gain(opendmr_encoder_t *enc, int gain_db)
+  * Input: b[9] voice parameters from MBEEncoder
+  * Output: 72-bit frame in DVSI/canonical order
+  */
+-static void encode_ambe_frame(const int b[9], uint8_t *frame72)
++static void params_to_bits49(const int b[9], uint8_t *bits49)
+ {
+     /* Pack b[9] into 49 bits, using OP25's ordering (ambe_encoder.cc
+      * encode_49bit). The parameters are INTERLEAVED, not concatenated: the most
+@@ -269,7 +269,6 @@ static void encode_ambe_frame(const int b[9], uint8_t *frame72)
+      * are the Golay-protected block. OpenDMR packed them sequentially — all 7
+      * bits of b0, then all 5 of b1 — which does not match the wire format its
+      * own decoder expects, so speech round-tripped to noise. */
+-    uint8_t bits49[49];
+     bits49[0] = (b[0] >> 6) & 1;
+     bits49[1] = (b[0] >> 5) & 1;
+     bits49[2] = (b[0] >> 4) & 1;
+@@ -320,6 +319,11 @@ static void encode_ambe_frame(const int b[9], uint8_t *frame72)
+     bits49[47] = (b[8] >> 1) & 1;
+     bits49[48] = b[8] & 1;
+ 
++}
++
++/* Apply Golay FEC to 49 bits and pack the resulting 72-bit frame. */
++static void bits49_to_frame72(const uint8_t *bits49, uint8_t *frame72)
++{
+     /* Extract 12-bit values for FEC encoding */
+     /* C0 = bits49[0-11], C1 = bits49[12-23], C2 = bits49[24-34], C3 = bits49[35-48] */
+     uint32_t c0 = 0, c1 = 0;
+@@ -384,7 +388,75 @@ bool opendmr_encode(opendmr_encoder_t *enc,
+     enc->enc->encode_dmr_params(pcm, b);
+ 
+     /* Encode voice parameters to 72-bit frame */
+-    encode_ambe_frame(b, ambe);
++    uint8_t bits49[49];
++    params_to_bits49(b, bits49);
++    bits49_to_frame72(bits49, ambe);
++
++    return true;
++}
++
++/*
++ * ============================================================================
++ * 49-bit API
++ * ============================================================================
++ */
++
++/* Unpack 7 left-aligned bytes into mbelib's one-bit-per-char array. */
++static void unpack_bits49(const uint8_t *in, char ambe_d[49])
++{
++    for (int i = 0; i < 49; i++)
++        ambe_d[i] = (in[i / 8] >> (7 - (i % 8))) & 1;
++}
++
++/* Pack mbelib's one-bit-per-char array into 7 left-aligned bytes. */
++static void pack_bits49(const uint8_t *bits, uint8_t *out)
++{
++    memset(out, 0, OPENDMR_AMBE49_BYTES);
++    for (int i = 0; i < 49; i++)
++        if (bits[i])
++            out[i / 8] |= (1 << (7 - (i % 8)));
++}
++
++bool opendmr_decode49(opendmr_decoder_t *dec,
++                      const uint8_t bits49[OPENDMR_AMBE49_BYTES],
++                      int16_t pcm[OPENDMR_PCM_SAMPLES],
++                      int *errs)
++{
++    if (!dec || !bits49 || !pcm)
++        return false;
++
++    char ambe_d[49];
++    unpack_bits49(bits49, ambe_d);
++
++    int err_count = 0;
++    int err_count2 = 0;
++    char err_str[64] = {0};
++
++    mbe_processAmbe2450Data(pcm, &err_count, &err_count2, err_str,
++                            ambe_d, &dec->cur_mp, &dec->prev_mp,
++                            &dec->prev_mp_enhanced, 3);
++
++    /* This path carries no FEC, so nothing can be corrected. Reported as zero
++       rather than left unset, so a caller reading it is not misled. */
++    if (errs)
++        *errs = 0;
++
++    return true;
++}
++
++bool opendmr_encode49(opendmr_encoder_t *enc,
++                      const int16_t pcm[OPENDMR_PCM_SAMPLES],
++                      uint8_t bits49[OPENDMR_AMBE49_BYTES])
++{
++    if (!enc || !enc->enc || !pcm || !bits49)
++        return false;
++
++    int b[9] = {0};
++    enc->enc->encode_dmr_params(pcm, b);
++
++    uint8_t bits[49];
++    params_to_bits49(b, bits);
++    pack_bits49(bits, bits49);
+ 
+     return true;
+ }
+diff --git a/opendmr.h b/opendmr.h
+index fd1e962..faad426 100644
+--- a/opendmr.h
++++ b/opendmr.h
+@@ -156,6 +156,52 @@ void opendmr_encoder_set_gain(opendmr_encoder_t *enc, int gain_db);
+  * ============================================================================
+  */
+ 
++/*
++ * ============================================================================
++ * 49-bit API — what MOTOTRBO IPSC actually carries
++ * ============================================================================
++ *
++ * Over the air a DMR voice frame is 72 bits: 49 bits of vocoder parameters plus
++ * Golay FEC. The repeater corrects and strips that FEC before putting the frame
++ * on the wire, so an IPSC gateway only ever sees the 49 bits.
++ *
++ * Going 49 -> 72 -> 49 just to use the frame API would mean re-deriving FEC
++ * that is about to be discarded, and getting it exactly right for no benefit.
++ * These entry points skip it.
++ */
++
++/* 49 bits packed MSB-first and left-aligned: bit 48 lands in the top bit of
++   byte 6, and the remaining 7 bits of that byte are unused. */
++#define OPENDMR_AMBE49_BYTES 7
++
++/**
++ * Decode 49-bit voice parameters straight to PCM.
++ *
++ * @param dec    Decoder instance.
++ * @param bits49 Input parameters (7 bytes, left-aligned).
++ * @param pcm    Output PCM buffer (160 samples, 16-bit signed).
++ * @param errs   Optional: always 0 on this path, which carries no FEC.
++ *
++ * @return true on success, false on failure.
++ */
++bool opendmr_decode49(opendmr_decoder_t *dec,
++                      const uint8_t bits49[OPENDMR_AMBE49_BYTES],
++                      int16_t pcm[OPENDMR_PCM_SAMPLES],
++                      int *errs);
++
++/**
++ * Encode PCM to 49-bit voice parameters, without adding FEC.
++ *
++ * @param enc    Encoder instance.
++ * @param pcm    Input PCM buffer (160 samples, 16-bit signed, 8kHz).
++ * @param bits49 Output parameters (7 bytes, left-aligned).
++ *
++ * @return true on success, false on failure.
++ */
++bool opendmr_encode49(opendmr_encoder_t *enc,
++                      const int16_t pcm[OPENDMR_PCM_SAMPLES],
++                      uint8_t bits49[OPENDMR_AMBE49_BYTES]);
++
+ /**
+  * Get library version string.
+  *
